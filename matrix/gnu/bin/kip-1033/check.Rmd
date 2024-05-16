@@ -1,0 +1,694 @@
+---
+title: "KIP-1033: Add Kafka Streams exception handler for exceptions occurring during processing"
+output: github_document
+---
+
+Created by [Damien Gasparina](https://cwiki.apache.org/confluence/display/~d.gasparina), last modified [yesterday at 07:20 AM](https://cwiki.apache.org/confluence/pages/diffpagesbyversion.action?pageId=300026309&selectedPageVersions=41&selectedPageVersions=42 "Show changes")
+
+-   [Status](https://cwiki.apache.org/confluence/display/KAFKA/KIP-1033%3A+Add+Kafka+Streams+exception+handler+for+exceptions+occurring+during+processing#KIP1033:AddKafkaStreamsexceptionhandlerforexceptionsoccurringduringprocessing-Status)
+
+-   [Motivation](https://cwiki.apache.org/confluence/display/KAFKA/KIP-1033%3A+Add+Kafka+Streams+exception+handler+for+exceptions+occurring+during+processing#KIP1033:AddKafkaStreamsexceptionhandlerforexceptionsoccurringduringprocessing-Motivation)
+
+-   [Proposed Changes](https://cwiki.apache.org/confluence/display/KAFKA/KIP-1033%3A+Add+Kafka+Streams+exception+handler+for+exceptions+occurring+during+processing#KIP1033:AddKafkaStreamsexceptionhandlerforexceptionsoccurringduringprocessing-ProposedChanges)
+
+    -   [Metrics](https://cwiki.apache.org/confluence/display/KAFKA/KIP-1033%3A+Add+Kafka+Streams+exception+handler+for+exceptions+occurring+during+processing#KIP1033:AddKafkaStreamsexceptionhandlerforexceptionsoccurringduringprocessing-Metrics)
+
+-   [Public Interfaces](https://cwiki.apache.org/confluence/display/KAFKA/KIP-1033%3A+Add+Kafka+Streams+exception+handler+for+exceptions+occurring+during+processing#KIP1033:AddKafkaStreamsexceptionhandlerforexceptionsoccurringduringprocessing-PublicInterfaces)
+
+-   [Compatibility, Deprecation, and Migration Plan](https://cwiki.apache.org/confluence/display/KAFKA/KIP-1033%3A+Add+Kafka+Streams+exception+handler+for+exceptions+occurring+during+processing#KIP1033:AddKafkaStreamsexceptionhandlerforexceptionsoccurringduringprocessing-Compatibility,Deprecation,andMigrationPlan)
+
+-   [Examples](https://cwiki.apache.org/confluence/display/KAFKA/KIP-1033%3A+Add+Kafka+Streams+exception+handler+for+exceptions+occurring+during+processing#KIP1033:AddKafkaStreamsexceptionhandlerforexceptionsoccurringduringprocessing-Examples)
+
+-   [Test Plan](https://cwiki.apache.org/confluence/display/KAFKA/KIP-1033%3A+Add+Kafka+Streams+exception+handler+for+exceptions+occurring+during+processing#KIP1033:AddKafkaStreamsexceptionhandlerforexceptionsoccurringduringprocessing-TestPlan)
+
+-   [Rejected Alternatives](https://cwiki.apache.org/confluence/display/KAFKA/KIP-1033%3A+Add+Kafka+Streams+exception+handler+for+exceptions+occurring+during+processing#KIP1033:AddKafkaStreamsexceptionhandlerforexceptionsoccurringduringprocessing-RejectedAlternatives)
+
+# Status
+
+**Current state**: *Accepted (targeting 3.8)\
+*
+
+**Discussion thread**: [here](https://lists.apache.org/thread/1nhhsrogmmv15o7mk9nj4kvkb5k2bx9s)*\
+*
+
+**JIRA**: [here](https://issues.apache.org/jira/browse/KAFKA-16448)
+
+Please keep the discussion on the mailing list rather than commenting on the wiki (wiki discussions get unwieldy fast).
+
+# Motivation
+
+*KIP inspired by Michelin [kstreamplify](https://github.com/michelin/kstreamplify) and coauthored by Damien Gasparina, Loïc Greffier and Sebastien Viale.*
+
+There are several places where an exception could arise in Kafka Streams. Currently, developers can implement a `DeserializationExceptionHandler`, to handle issues during the deserialization, and a `ProductionExceptionHandler` for issues happening during the production. 
+
+For
+issues happening during the process of a message, it's up to the
+developer to add the required try/catch when they leverage the DSL or
+the Processor API. All uncaught exceptions will terminate the processing
+or the StreamThread. This approach is quite tedious and error prone
+when you are developing a large topology.
+
+This
+proposal aims to add a new Exception handling mechanism to manage
+exceptions happening during the processing of a message. It will be
+invoked if an exception happens during the invocation of a
+Processor.process. Similar to the other exception handler, it would
+include two out of the box implementations: `LogAndFail`, the default to be backward compatible, and `LogAndContinue`.
+
+This
+KIP also proposes to unify the method signatures of the
+DeserializationExceptionHandler and the ProductionExceptionHandler.
+Currently, the DeserializationExceptionHandler is leveraging the old
+ProcessorContext and the ProductionExceptionHandler does not have access
+to any context. As the ProcessorContext is exposing many methods that
+should not be accessed during the exception handler, e.g. forward(),
+this KIP introduces a new container class exposing only the metadata of
+the processing context: ErrorHandlerContext.
+
+# Proposed Changes
+
+We
+propose to add a new exception handler that could be set by the user to
+handle exceptions happening during the process of a message.
+
+The interface would be:
+
+**ProcessingExceptionHandler.java**
+
++----+------------------------------------------------------------------------------------------------------------+
+| 1  | `package` `org.apache.kafka.streams.errors;`                                                               |
+|    |                                                                                                            |
+| 2  |                                                                                                            |
+|    |                                                                                                            |
+| 3  | `/**`                                                                                                      |
+|    |                                                                                                            |
+| 4  | `* An interface that allows user code to inspect a record that has failed processing`                      |
+|    |                                                                                                            |
+| 5  | `*/`                                                                                                       |
+|    |                                                                                                            |
+| 6  | `public` `interface` `ProcessingExceptionHandler extends` `Configurable {`                                 |
+|    |                                                                                                            |
+| 7  | `/**`                                                                                                      |
+|    |                                                                                                            |
+| 8  | `* Inspect a record and the exception received`                                                            |
+|    |                                                                                                            |
+| 9  | `* @param context processing context metadata`                                                             |
+|    |                                                                                                            |
+| 10 | `* @param record record where the exception occurred`                                                      |
+|    |                                                                                                            |
+| 11 | `* @param exception the actual exception`                                                                  |
+|    |                                                                                                            |
+| 12 | `*/`                                                                                                       |
+|    |                                                                                                            |
+| 13 | `ProcessingHandlerResponse handle(ErrorHandlerContext context, Record<?, ?> record, Exception exception);` |
+|    |                                                                                                            |
+| 14 |                                                                                                            |
+|    |                                                                                                            |
+| 15 |                                                                                                            |
+|    |                                                                                                            |
+| 16 | `public` `enum` `ProcessingHandlerResponse {`                                                              |
+|    |                                                                                                            |
+| 17 | `/* continue with processing */`                                                                           |
+|    |                                                                                                            |
+| 18 | `CONTINUE(1, "CONTINUE"),`                                                                                 |
+|    |                                                                                                            |
+| 19 | `/* fail the processing and stop */`                                                                       |
+|    |                                                                                                            |
+| 20 | `FAIL(2, "FAIL");`                                                                                         |
+|    |                                                                                                            |
+| 21 | `...`                                                                                                      |
+|    |                                                                                                            |
+| 22 | `}`                                                                                                        |
+|    |                                                                                                            |
+| 23 | `}`                                                                                                        |
++----+------------------------------------------------------------------------------------------------------------+
+
+To not expose sensitive information
+during the handler invocation, this KIP also introduces a new container
+class exposing only Processing metadata to the handler, as those
+metadata could hold longer than the ProcessingContext due the
+ProductionExceptionHandler:
+
+**ErrorHandlerContext.java**
+
++-------------------------------------------------------------------------------------------------------------------+
+| `/**`                                                                                                             |
+|                                                                                                                   |
+| `* ErrorHandlerContext interface`                                                                                 |
+|                                                                                                                   |
+| `*/`                                                                                                              |
+|                                                                                                                   |
+| `public` `interface` `ErrorHandlerContext {`                                                                      |
+|                                                                                                                   |
+|                                                                                                                   |
+|                                                                                                                   |
+| `/**`                                                                                                             |
+|                                                                                                                   |
+| `* Return the topic name of the current input record; could be {@code null} if it is not`                         |
+|                                                                                                                   |
+| `* available.`                                                                                                    |
+|                                                                                                                   |
+| `*`                                                                                                               |
+|                                                                                                                   |
+| `* <p> For example, if this method is invoked within a {@link Punctuator#punctuate(long)`                         |
+|                                                                                                                   |
+| `* punctuation callback}, or while processing a record that was forwarded by a punctuation`                       |
+|                                                                                                                   |
+| `* callback, the record won't have an associated topic.`                                                          |
+|                                                                                                                   |
+| `* Another example is`                                                                                            |
+|                                                                                                                   |
+| `* {@link org.apache.kafka.streams.kstream.KTable#transformValues(ValueTransformerWithKeySupplier, String...)}`   |
+|                                                                                                                   |
+| `* (and siblings), that do not always guarantee to provide a valid topic name, as they might be`                  |
+|                                                                                                                   |
+| `* executed "out-of-band" due to some internal optimizations applied by the Kafka Streams DSL.`                   |
+|                                                                                                                   |
+| `*`                                                                                                               |
+|                                                                                                                   |
+| `* @return the topic name`                                                                                        |
+|                                                                                                                   |
+| `*/`                                                                                                              |
+|                                                                                                                   |
+| `String topic();`                                                                                                 |
+|                                                                                                                   |
+|                                                                                                                   |
+|                                                                                                                   |
+| `/**`                                                                                                             |
+|                                                                                                                   |
+| `* Return the partition id of the current input record; could be {@code -1} if it is not`                         |
+|                                                                                                                   |
+| `* available.`                                                                                                    |
+|                                                                                                                   |
+| `*`                                                                                                               |
+|                                                                                                                   |
+| `* <p> For example, if this method is invoked within a {@link Punctuator#punctuate(long)`                         |
+|                                                                                                                   |
+| `* punctuation callback}, or while processing a record that was forwarded by a punctuation`                       |
+|                                                                                                                   |
+| `* callback, the record won't have an associated partition id.`                                                   |
+|                                                                                                                   |
+| `* Another example is`                                                                                            |
+|                                                                                                                   |
+| `* {@link org.apache.kafka.streams.kstream.KTable#transformValues(ValueTransformerWithKeySupplier, String...)}`   |
+|                                                                                                                   |
+| `* (and siblings), that do not always guarantee to provide a valid partition id, as they might be`                |
+|                                                                                                                   |
+| `* executed "out-of-band" due to some internal optimizations applied by the Kafka Streams DSL.`                   |
+|                                                                                                                   |
+| `*`                                                                                                               |
+|                                                                                                                   |
+| `* @return the partition id`                                                                                      |
+|                                                                                                                   |
+| `*/`                                                                                                              |
+|                                                                                                                   |
+| `int` `partition();`                                                                                              |
+|                                                                                                                   |
+|                                                                                                                   |
+|                                                                                                                   |
+| `/**`                                                                                                             |
+|                                                                                                                   |
+| `* Return the offset of the current input record; could be {@code -1} if it is not`                               |
+|                                                                                                                   |
+| `* available.`                                                                                                    |
+|                                                                                                                   |
+| `*`                                                                                                               |
+|                                                                                                                   |
+| `* <p> For example, if this method is invoked within a {@link Punctuator#punctuate(long)`                         |
+|                                                                                                                   |
+| `* punctuation callback}, or while processing a record that was forwarded by a punctuation`                       |
+|                                                                                                                   |
+| `* callback, the record won't have an associated offset.`                                                         |
+|                                                                                                                   |
+| `* Another example is`                                                                                            |
+|                                                                                                                   |
+| `* {@link org.apache.kafka.streams.kstream.KTable#transformValues(ValueTransformerWithKeySupplier, String...)}`   |
+|                                                                                                                   |
+| `* (and siblings), that do not always guarantee to provide a valid offset, as they might be`                      |
+|                                                                                                                   |
+| `* executed "out-of-band" due to some internal optimizations applied by the Kafka Streams DSL.`                   |
+|                                                                                                                   |
+| `*`                                                                                                               |
+|                                                                                                                   |
+| `* @return the offset`                                                                                            |
+|                                                                                                                   |
+| `*/`                                                                                                              |
+|                                                                                                                   |
+| `long` `offset();`                                                                                                |
+|                                                                                                                   |
+|                                                                                                                   |
+|                                                                                                                   |
+| `/**`                                                                                                             |
+|                                                                                                                   |
+| `* Return the headers of the current source record; could be an empty header if it is not`                        |
+|                                                                                                                   |
+| `* available.`                                                                                                    |
+|                                                                                                                   |
+| `*`                                                                                                               |
+|                                                                                                                   |
+| `* <p> For example, if this method is invoked within a {@link Punctuator#punctuate(long)`                         |
+|                                                                                                                   |
+| `* punctuation callback}, or while processing a record that was forwarded by a punctuation`                       |
+|                                                                                                                   |
+| `* callback, the record might not have any associated headers.`                                                   |
+|                                                                                                                   |
+| `* Another example is`                                                                                            |
+|                                                                                                                   |
+| `* {@link org.apache.kafka.streams.kstream.KTable#transformValues(ValueTransformerWithKeySupplier, String...)}`   |
+|                                                                                                                   |
+| `* (and siblings), that do not always guarantee to provide valid headers, as they might be`                       |
+|                                                                                                                   |
+| `* executed "out-of-band" due to some internal optimizations applied by the Kafka Streams DSL.`                   |
+|                                                                                                                   |
+| `*`                                                                                                               |
+|                                                                                                                   |
+| `* @return the headers`                                                                                           |
+|                                                                                                                   |
+| `*/`                                                                                                              |
+|                                                                                                                   |
+| `Headers headers();`                                                                                              |
+|                                                                                                                   |
+|                                                                                                                   |
+|                                                                                                                   |
+| `/**`                                                                                                             |
+|                                                                                                                   |
+| `* Return the non-deserialized byte[] of the input message key if the context has been triggered by a message.`   |
+|                                                                                                                   |
+| `*`                                                                                                               |
+|                                                                                                                   |
+| `* <p> If this method is invoked within a {@link Punctuator#punctuate(long)`                                      |
+|                                                                                                                   |
+| `* punctuation callback}, or while processing a record that was forwarded by a punctuation`                       |
+|                                                                                                                   |
+| `* callback, it will return null.`                                                                                |
+|                                                                                                                   |
+| `*`                                                                                                               |
+|                                                                                                                   |
+| `* <p> If this method is invoked in a sub-topology due to a repartition, the returned key would be one sent`      |
+|                                                                                                                   |
+| `* to the repartition topic.`                                                                                     |
+|                                                                                                                   |
+| `*`                                                                                                               |
+|                                                                                                                   |
+| `* <p> Always returns null if this method is invoked within a`                                                    |
+|                                                                                                                   |
+| `* {@link ProductionExceptionHandler.handle(ErrorHandlerContext, ProducerRecord, Exception)}`                     |
+|                                                                                                                   |
+| `*`                                                                                                               |
+|                                                                                                                   |
+| `* @return the raw byte of the key of the source message`                                                         |
+|                                                                                                                   |
+| `*/`                                                                                                              |
+|                                                                                                                   |
+| `byte[] sourceRawKey();`                                                                                          |
+|                                                                                                                   |
+|                                                                                                                   |
+|                                                                                                                   |
+| `/**`                                                                                                             |
+|                                                                                                                   |
+| `* Return the non-deserialized byte[] of the input message value if the context has been triggered by a message.` |
+|                                                                                                                   |
+| `*`                                                                                                               |
+|                                                                                                                   |
+| `* <p> If this method is invoked within a {@link Punctuator#punctuate(long)`                                      |
+|                                                                                                                   |
+| `* punctuation callback}, or while processing a record that was forwarded by a punctuation`                       |
+|                                                                                                                   |
+| `* callback, it will return null.`                                                                                |
+|                                                                                                                   |
+| `*`                                                                                                               |
+|                                                                                                                   |
+| `* <p> If this method is invoked in a sub-topology due to a repartition, the returned value would be one sent`    |
+|                                                                                                                   |
+| `* to the repartition topic.`                                                                                     |
+|                                                                                                                   |
+| `*`                                                                                                               |
+|                                                                                                                   |
+| `* <p> Always returns null if this method is invoked within a`                                                    |
+|                                                                                                                   |
+| `* {@link ProductionExceptionHandler.handle(ErrorHandlerContext, ProducerRecord, Exception)}`                     |
+|                                                                                                                   |
+| `*`                                                                                                               |
+|                                                                                                                   |
+| `* @return the raw byte of the value of the source message`                                                       |
+|                                                                                                                   |
+| `*/`                                                                                                              |
+|                                                                                                                   |
+| `byte[] sourceRawValue();`                                                                                        |
+|                                                                                                                   |
+|                                                                                                                   |
+|                                                                                                                   |
+| `/**`                                                                                                             |
+|                                                                                                                   |
+| `* Return the current processor node id.`                                                                         |
+|                                                                                                                   |
+| `*`                                                                                                               |
+|                                                                                                                   |
+| `* @return the processor node id`                                                                                 |
+|                                                                                                                   |
+| `*/`                                                                                                              |
+|                                                                                                                   |
+| `String processorNodeId();`                                                                                       |
+|                                                                                                                   |
+|                                                                                                                   |
+|                                                                                                                   |
+| `/**`                                                                                                             |
+|                                                                                                                   |
+| `* Return the task id.`                                                                                           |
+|                                                                                                                   |
+| `*`                                                                                                               |
+|                                                                                                                   |
+| `* @return the task id`                                                                                           |
+|                                                                                                                   |
+| `*/`                                                                                                              |
+|                                                                                                                   |
+| `TaskId taskId();`                                                                                                |
+|                                                                                                                   |
+| `}`                                                                                                               |
++-------------------------------------------------------------------------------------------------------------------+
+
+To be
+consistent with other handlers, this KIP proposes to expose the new
+ErrorHandlerContext as a parameter to the Deserialization and Production
+exception handlers and deprecate the previous handle signature. To be
+backward compatible with existing handlers, a default implementation
+would be provided to ensure that the previous handler is invoked by
+default. A default implementation for the deprecated method is also
+implemented to allow user to not implement the deprecated method while
+implementing the interface.
+
+Note: to avoid memory
+pressure, the sourceRawKey and sourceRawValue attributes would always be
+null during the ProductionExceptionHandlerResponse.handle method.
+
+The ProductionExceptionHandler interface will be:
+
+**ProductionExceptionHandler.java**
+
++--------------------------------------------------------------------------------------------------------------------+
+| `/**`                                                                                                              |
+|                                                                                                                    |
+| `* ...`                                                                                                            |
+|                                                                                                                    |
+| `*/`                                                                                                               |
+|                                                                                                                    |
+| `public` `interface` `ProductionExceptionHandler extends` `Configurable {`                                         |
+|                                                                                                                    |
+| `/**`                                                                                                              |
+|                                                                                                                    |
+| `* ...`                                                                                                            |
+|                                                                                                                    |
+| `* @deprecated Please use the ProductionExceptionHandlerResponse.handle(metadata, record, exception)`              |
+|                                                                                                                    |
+| `*/`                                                                                                               |
+|                                                                                                                    |
+| `@Deprecated`                                                                                                      |
+|                                                                                                                    |
+| `default` `ProductionExceptionHandlerResponse handle(final` `ProducerRecord<byte[], byte[]> record,`               |
+|                                                                                                                    |
+| `final` `Exception exception) {`                                                                                   |
+|                                                                                                                    |
+| `throw` `new` `NotImplementedException();`                                                                         |
+|                                                                                                                    |
+| `}`                                                                                                                |
+|                                                                                                                    |
+|                                                                                                                    |
+|                                                                                                                    |
+| `/**`                                                                                                              |
+|                                                                                                                    |
+| `* Inspect a record that we attempted to produce, and the exception that resulted`                                 |
+|                                                                                                                    |
+| `* from attempting to produce it and determine whether or not to continue processing.`                             |
+|                                                                                                                    |
+| `*`                                                                                                                |
+|                                                                                                                    |
+| `* @param context The error handler context metadata`                                                              |
+|                                                                                                                    |
+| `* @param record The record that failed to produce`                                                                |
+|                                                                                                                    |
+| `* @param exception The exception that occurred during production`                                                 |
+|                                                                                                                    |
+| `*/`                                                                                                               |
+|                                                                                                                    |
+| `@SuppressWarnings("deprecation")`                                                                                 |
+|                                                                                                                    |
+| `default` `ProductionExceptionHandlerResponse handle(final` `ErrorHandlerContext context,`                         |
+|                                                                                                                    |
+| `final` `ProducerRecord<byte[], byte[]> record,`                                                                   |
+|                                                                                                                    |
+| `final` `Exception exception) {`                                                                                   |
+|                                                                                                                    |
+| `return` `handle(record, exception);`                                                                              |
+|                                                                                                                    |
+| `}`                                                                                                                |
+|                                                                                                                    |
+|                                                                                                                    |
+|                                                                                                                    |
+| `/**`                                                                                                              |
+|                                                                                                                    |
+| `* ...`                                                                                                            |
+|                                                                                                                    |
+| `* @deprecated          Please use the handleSerializationException(record, exception, context)`                   |
+|                                                                                                                    |
+| `*/`                                                                                                               |
+|                                                                                                                    |
+| `@Deprecated`                                                                                                      |
+|                                                                                                                    |
+| `default` `ProductionExceptionHandlerResponse handleSerializationException(final` `ProducerRecord record,`         |
+|                                                                                                                    |
+| `final` `Exception exception) {`                                                                                   |
+|                                                                                                                    |
+| `return` `ProductionExceptionHandlerResponse.FAIL;`                                                                |
+|                                                                                                                    |
+| `}`                                                                                                                |
+|                                                                                                                    |
+|                                                                                                                    |
+|                                                                                                                    |
+| `/**`                                                                                                              |
+|                                                                                                                    |
+| `* Handles serialization exception and determine if the process should continue. The default implementation is to` |
+|                                                                                                                    |
+| `* fail the process.`                                                                                              |
+|                                                                                                                    |
+| `*`                                                                                                                |
+|                                                                                                                    |
+| `* @param context       the error handler context metadata`                                                        |
+|                                                                                                                    |
+| `* @param record        the record that failed to serialize`                                                       |
+|                                                                                                                    |
+| `* @param exception     the exception that occurred during serialization`                                          |
+|                                                                                                                    |
+| `*/`                                                                                                               |
+|                                                                                                                    |
+| `@SuppressWarnings("deprecation")`                                                                                 |
+|                                                                                                                    |
+| `default` `ProductionExceptionHandlerResponse handleSerializationException(final` `ErrorHandlerContext context,`   |
+|                                                                                                                    |
+| `final` `ProducerRecord record,`                                                                                   |
+|                                                                                                                    |
+| `final` `Exception exception,`                                                                                     |
+|                                                                                                                    |
+| `final` `SerializationExceptionOrigin origin) {`                                                                   |
+|                                                                                                                    |
+| `return` `handleSerializationException(record, exception);`                                                        |
+|                                                                                                                    |
+| `}`                                                                                                                |
+|                                                                                                                    |
+| `}`                                                                                                                |
++--------------------------------------------------------------------------------------------------------------------+
+
+The deserializationExceptionHandler would be:
+
+**DeserializationExceptionHandler.java**
+
++----------------------------------------------------------------------------------------------------------------------------------+
+| `public` `interface` `DeserializationExceptionHandler extends` `Configurable {`                                                  |
+|                                                                                                                                  |
+| `// ...`                                                                                                                         |
+|                                                                                                                                  |
+|                                                                                                                                  |
+|                                                                                                                                  |
+| `/*`                                                                                                                             |
+|                                                                                                                                  |
+| `* ...`                                                                                                                          |
+|                                                                                                                                  |
+| `* @deprecated Please use the DeserializationExceptionHandlerResponse.handle(errorContextMetadata, record, errorHandlerContext)` |
+|                                                                                                                                  |
+| `*/`                                                                                                                             |
+|                                                                                                                                  |
+| `@Deprecated`                                                                                                                    |
+|                                                                                                                                  |
+| `default` `DeserializationHandlerResponse handle(final` `ProcessorContext context,`                                              |
+|                                                                                                                                  |
+| `final` `ConsumerRecord<byte[], byte[]> record,`                                                                                 |
+|                                                                                                                                  |
+| `final` `Exception exception) {`                                                                                                 |
+|                                                                                                                                  |
+| `throw` `new` `NotImplementedException();`                                                                                       |
+|                                                                                                                                  |
+| `}`                                                                                                                              |
+|                                                                                                                                  |
+|                                                                                                                                  |
+|                                                                                                                                  |
+| `/**`                                                                                                                            |
+|                                                                                                                                  |
+| `* Inspect a record and the exception received.`                                                                                 |
+|                                                                                                                                  |
+| `*`                                                                                                                              |
+|                                                                                                                                  |
+| `* @param context error handler context`                                                                                         |
+|                                                                                                                                  |
+| `* @param record record that failed deserialization`                                                                             |
+|                                                                                                                                  |
+| `* @param exception the actual exception`                                                                                        |
+|                                                                                                                                  |
+| `*/`                                                                                                                             |
+|                                                                                                                                  |
+| `default` `DeserializationHandlerResponse handle(final` `ErrorHandlerContext context,`                                           |
+|                                                                                                                                  |
+| `final` `ConsumerRecord<byte[], byte[]> record,`                                                                                 |
+|                                                                                                                                  |
+| `final` `Exception exception) {`                                                                                                 |
+|                                                                                                                                  |
+| `return` `handle(((ErrorHandlerContextImpl) context).convertToProcessorContext(), record, exception);`                           |
+|                                                                                                                                  |
+| `}`                                                                                                                              |
+|                                                                                                                                  |
+| `// ...`                                                                                                                         |
+|                                                                                                                                  |
+| `}`                                                                                                                              |
++----------------------------------------------------------------------------------------------------------------------------------+
+
+To identify the origin of the serialization exception, a new SerializationExceptionOrigin would be provided in the serialization handler:
+
+**SerializationExceptionOrigin.java**
+
++----------------------------------------------+
+| `package` `org.apache.kafka.streams.errors;` |
+|                                              |
+|                                              |
+|                                              |
+| `enum` `SerializationExceptionOrigin {`      |
+|                                              |
+| `KEY,`                                       |
+|                                              |
+| `VALUE`                                      |
+|                                              |
+| `}`                                          |
++----------------------------------------------+
+
+## Metrics
+
+The following metrics will be incremented each time the ProcessingExceptionHandler has been invoked and returned CONTINUE.\
+
++------------------------------+---------------------------------------------+---------------------------------------------------+------------------------------------------------------------------+----------------------------------------------------------------------------------------------------------------+
+|                              | LEVEL 0                                     | LEVEL 1                                           | LEVEL 2                                                          | LEVEL 3                                                                                                        |
++------------------------------+---------------------------------------------+---------------------------------------------------+------------------------------------------------------------------+----------------------------------------------------------------------------------------------------------------+
+|                              | Per-Client                                  | Per-Thread                                        | Per-Task                                                         | Per-Processor-Node                                                                                             |
++------------------------------+---------------------------------------------+---------------------------------------------------+------------------------------------------------------------------+----------------------------------------------------------------------------------------------------------------+
+| TAGS                         | *type=stream-metrics,client-id=[client-id]* | *type=stream-thread-metrics,thread-id=[threadId]* | *type=stream-task-metrics,thread-id=[threadId],task-id=[taskId]* | *type=stream-processor-node-metrics,thread-id=[threadId],task-id=[taskId],processor-node-id=[processorNodeId]* |
++------------------------------+---------------------------------------------+---------------------------------------------------+------------------------------------------------------------------+----------------------------------------------------------------------------------------------------------------+
+| ```                          |                                             |                                                   | INFO                                                             |                                                                                                                |
+| dropped-records (rate|total) |                                             |                                                   |                                                                  |                                                                                                                |
+| ```                          |                                             |                                                   |                                                                  |                                                                                                                |
++------------------------------+---------------------------------------------+---------------------------------------------------+------------------------------------------------------------------+----------------------------------------------------------------------------------------------------------------+
+
+# Public Interfaces
+
+Users will be able to set an exception handler through the following new config option which points to a class name.
+
+`public static final String PROCESSING_EXCEPTION_HANDLER_CLASS_CONFIG = "processing.exception.handler".`
+
+Two implementations of the interface will be provided. The default will be the `LogAndFailExceptionHandler` to ensure the backward compatibility of the API
+
++----+-----------------------------------------------------------------------------------------------------------+
+| 1  | `// logs the error and returns CONTINUE`                                                                  |
+|    |                                                                                                           |
+| 2  | `public` `class` `ProcessingLogAndContinueExceptionHandler implements` `ProcessingExceptionHandler {...}` |
+|    |                                                                                                           |
+| 3  |                                                                                                           |
+|    |                                                                                                           |
+| 4  | `// logs the error and returns FAIL`                                                                      |
+|    |                                                                                                           |
+| 5  | `public` `class` `ProcessingLogAndFailExceptionHandler implements` `ProcessingExceptionHandler {...}`     |
+|    |                                                                                                           |
+| 6  | `// Then in StreamsConfig.java:`                                                                          |
+|    |                                                                                                           |
+| 7  |                                                                                                           |
+|    |                                                                                                           |
+| 8  | `.define(PROCESSING_EXCEPTION_HANDLER_CLASS_CONFIG,`                                                      |
+|    |                                                                                                           |
+| 9  | `Type.CLASS,`                                                                                             |
+|    |                                                                                                           |
+| 10 | `ProcessingLogAndFailExceptionHandler.class.getName(),`                                                   |
+|    |                                                                                                           |
+| 11 | `Importance.MEDIUM,`                                                                                      |
+|    |                                                                                                           |
+| 12 | `PROCESSING_EXCEPTION_HANDLER_CLASS_DOC)`                                                                 |
++----+-----------------------------------------------------------------------------------------------------------+
+
+# Compatibility, Deprecation, and Migration Plan
+
+In the current version, exceptions thrown during the processing of a message are not caught, and thus will be sent to the `uncaughtExceptionHandler` and will terminate the StreamThread. To be backward compatible, the `ProcessingLogAndFailExceptionHandler` will be set as default.
+
+# Examples
+
+**LogAndContinueProcessingExceptionHandler.java**
+
++----------------------------------------------------------------------------------------------------------------------+
+| `public` `class` `LogAndContinueProcessingExceptionHandler implements` `ProcessingExceptionHandler {`                |
+|                                                                                                                      |
+| `private` `static` `final` `Logger log = LoggerFactory.getLogger(LogAndContinueProcessingExceptionHandler.class);`   |
+|                                                                                                                      |
+|                                                                                                                      |
+|                                                                                                                      |
+| `@Override`                                                                                                          |
+|                                                                                                                      |
+| `public` `void` `configure(Map<String, ?> configs) {`                                                                |
+|                                                                                                                      |
+| `// ignore`                                                                                                          |
+|                                                                                                                      |
+| `}`                                                                                                                  |
+|                                                                                                                      |
+|                                                                                                                      |
+|                                                                                                                      |
+| `@Override`                                                                                                          |
+|                                                                                                                      |
+| `public` `ProcessingHandlerResponse handle(ErrorHandlerContext context, Record<?, ?> record, Exception exception) {` |
+|                                                                                                                      |
+| `log.warn("Exception caught during message processing, "` `+`                                                        |
+|                                                                                                                      |
+| `"processor node: {}, taskId: {}, source topic: {}, source partition: {}, source offset: {}",`                       |
+|                                                                                                                      |
+| `context.processorNodeId(), context.taskId(), context.topic(), context.partition(), context.offset(),`               |
+|                                                                                                                      |
+| `exception);`                                                                                                        |
+|                                                                                                                      |
+|                                                                                                                      |
+|                                                                                                                      |
+| `return` `ProcessingHandlerResponse.CONTINUE;`                                                                       |
+|                                                                                                                      |
+| `}`                                                                                                                  |
+|                                                                                                                      |
+| `}`                                                                                                                  |
++----------------------------------------------------------------------------------------------------------------------+
+
+# Test Plan
+
+-   A unit test will be implemented to ensure that exceptions are caught by the `ProcessingExceptionHandler`and the provided implementations.
+
+-   A unit test will be implemented to ensure the backward compatibility.
+
+-   An integration test will be done to ensure that the right exceptions are caught.
+
+# Rejected Alternatives
+
+-   **Allow per node exception handler**,
+    specifying an exception handler could be error prone and would add
+    complexity to the DSL API. If required, it is still possible to rely on
+    simple try/catch to have specific error handling behavior per node.
+
+-   **Sending to a** **DeadLetterQueue**.
+    DeadLetterQueue implementation could make sense, but the work would be
+    done in a separate KIP. Sending messages to a dead letter queue is
+    possible, but it is up to the user  to implement it
